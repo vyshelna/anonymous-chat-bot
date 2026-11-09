@@ -13,13 +13,21 @@
 import asyncio
 import logging
 import os
+import random
 from collections import deque
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 # ====================== НАСТРОЙКИ ======================
 # Токен берётся из переменной окружения (в коде его хранить нельзя)
@@ -29,6 +37,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 BTN_SEARCH = "Искать собеседника"
 BTN_STOP = "Завершить"
 BTN_NEXT = "Следующий"
+
+# Капча после медиа: если пользователь отправил фото, видео (или кружок) в диалоге
+# и собеседник завершил диалог (/stop или /next), перед новым поиском нужна проверка.
+# True — капча также нужна, если пользователь сам завершил диалог после видео.
+CAPTCHA_ON_OWN_END = False
 
 # ====================== КЛАВИАТУРЫ ======================
 # Когда пользователь не в диалоге
@@ -51,6 +64,9 @@ kb_wait = ReplyKeyboardMarkup(
 waiting: deque[int] = deque()   # очередь ожидающих собеседника
 partners: dict[int, int] = {}   # user_id -> user_id собеседника (в обе стороны)
 lock = asyncio.Lock()           # защита от гонок при одновременных запросах
+sent_video: set[int] = set()    # кто отправлял видео в текущем диалоге
+need_captcha: set[int] = set()  # кому нужно пройти капчу перед новым поиском
+captcha_answers: dict[int, int] = {}  # user_id -> правильный ответ на текущую капчу
 
 router = Router()
 
@@ -65,6 +81,40 @@ async def safe_send(bot: Bot, chat_id: int, text: str, kb=None) -> bool:
         return False
 
 
+def make_captcha(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Создаёт простой пример со сложением и 4 вариантами ответа."""
+    a, b = random.randint(2, 9), random.randint(2, 9)
+    answer = a + b
+    options = {answer}
+    while len(options) < 4:
+        options.add(max(2, answer + random.randint(-5, 5)))
+    options = list(options)
+    random.shuffle(options)
+    captcha_answers[user_id] = answer
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=str(o), callback_data=f"cap:{o}") for o in options]]
+    )
+    return f"🤖 Проверка: сколько будет {a} + {b}?", kb
+
+
+async def send_captcha(bot: Bot, user_id: int) -> None:
+    text, kb = make_captcha(user_id)
+    await safe_send(bot, user_id, text, kb)
+
+
+async def notify_left(bot: Bot, partner: int) -> None:
+    """Сообщает собеседнику, что диалог завершён (и просит капчу, если нужно)."""
+    if partner in need_captcha:
+        await safe_send(
+            bot, partner,
+            "Собеседник завершил диалог. Чтобы продолжить, пройдите быструю проверку 👇",
+            kb_idle,
+        )
+        await send_captcha(bot, partner)
+    else:
+        await safe_send(bot, partner, "Собеседник завершил диалог.", kb_idle)
+
+
 async def leave(user_id: int) -> tuple[int | None, bool]:
     """
     Убирает пользователя из очереди и/или из диалога.
@@ -77,11 +127,26 @@ async def leave(user_id: int) -> tuple[int | None, bool]:
         partner = partners.pop(user_id, None)
         if partner is not None:
             partners.pop(partner, None)
+            # Собеседник отправлял видео, а диалог завершил другой -> капча
+            if partner in sent_video:
+                need_captcha.add(partner)
+            if CAPTCHA_ON_OWN_END and user_id in sent_video:
+                need_captcha.add(user_id)
+        # Новый диалог начнётся с чистого листа
+        sent_video.discard(user_id)
+        if partner is not None:
+            sent_video.discard(partner)
         return partner, was_waiting
 
 
 async def start_search(user_id: int, bot: Bot) -> None:
     """Ставит пользователя в очередь или сразу соединяет с ожидающим."""
+    # Сначала нужно пройти капчу, если она требуется
+    if user_id in need_captcha:
+        await safe_send(bot, user_id, "Сначала пройдите проверку 👇", kb_idle)
+        await send_captcha(bot, user_id)
+        return
+
     async with lock:
         if user_id in partners:
             state = "in_chat"
@@ -141,7 +206,9 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
 
     if partner is not None:
         await safe_send(bot, user_id, "Диалог завершён.", kb_idle)
-        await safe_send(bot, partner, "Собеседник завершил диалог.", kb_idle)
+        if user_id in need_captcha:  # только при CAPTCHA_ON_OWN_END = True
+            await send_captcha(bot, user_id)
+        await notify_left(bot, partner)
     elif was_waiting:
         await safe_send(bot, user_id, "Поиск отменён.", kb_idle)
     else:
@@ -154,9 +221,39 @@ async def cmd_next(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
     partner, _ = await leave(user_id)
     if partner is not None:
-        await safe_send(bot, partner, "Собеседник завершил диалог.", kb_idle)
-    # Сразу ищем нового
+        await notify_left(bot, partner)
+    # Сразу ищем нового (если нужна капча, start_search её запросит)
     await start_search(user_id, bot)
+
+
+# ====================== КАПЧА (нажатие кнопки с ответом) ======================
+@router.callback_query(F.data.startswith("cap:"))
+async def on_captcha(call: CallbackQuery, bot: Bot) -> None:
+    user_id = call.from_user.id
+    expected = captcha_answers.get(user_id)
+
+    if expected is None:
+        await call.answer("Проверка уже пройдена или устарела.")
+        return
+
+    chosen = int(call.data.split(":")[1])
+    if chosen == expected:
+        captcha_answers.pop(user_id, None)
+        need_captcha.discard(user_id)
+        await call.answer("Верно!")
+        try:
+            await call.message.edit_text("✅ Проверка пройдена.")
+        except TelegramBadRequest:
+            pass
+        await safe_send(bot, user_id, "Теперь можно искать собеседника.", kb_idle)
+    else:
+        # Неверно — выдаём новый пример
+        text, kb = make_captcha(user_id)
+        await call.answer("Неверно, попробуйте ещё раз.")
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
 
 
 # ====================== ПЕРЕСЫЛКА СООБЩЕНИЙ ======================
@@ -166,6 +263,9 @@ async def relay(message: Message, bot: Bot) -> None:
     partner = partners.get(user_id)
 
     if partner is None:
+        if user_id in need_captcha:
+            await send_captcha(bot, user_id)
+            return
         # Неизвестная команда или сообщение вне диалога
         await message.answer("Вы не в диалоге. Нажмите «Искать собеседника».", reply_markup=kb_idle)
         return
@@ -179,6 +279,9 @@ async def relay(message: Message, bot: Bot) -> None:
         # поэтому имя, username и ID отправителя полностью скрыты.
         # Работает для текста, стикеров, фото, голосовых, видео, кружков, файлов и т.д.
         await message.copy_to(partner)
+        # Запоминаем, что пользователь отправлял фото/видео/кружок в этом диалоге
+        if message.photo or message.video or message.video_note:
+            sent_video.add(user_id)
     except TelegramForbiddenError:
         # Собеседник заблокировал бота — завершаем диалог
         await leave(user_id)

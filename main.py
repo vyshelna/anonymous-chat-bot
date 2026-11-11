@@ -155,6 +155,7 @@ report_pending: dict[int, int] = {}   # user_id -> собеседник, на к
 # user_id -> (бывший собеседник, последние сообщения): чтобы пожаловаться сразу после конца диалога.
 # Хранится в памяти только до начала следующего диалога или до жалобы.
 last_dialog: dict[int, tuple[int, list]] = {}
+search_msgs: dict[int, int] = {}      # user_id -> id сообщения «Ищем собеседника…» (удаляется при соединении)
 last_partner: dict[int, int] = {}     # user_id -> последний собеседник (для «вернуть собеседника»)
 return_requests: dict[int, int] = {}  # собеседник -> тот, кто хочет вернуться (ждёт согласия)
 pay_wait: dict[int, int] = {}         # покупатель -> собеседник (согласие получено, ждём оплату)
@@ -166,13 +167,32 @@ router = Router()
 
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
-async def safe_send(bot: Bot, chat_id: int, text: str, kb=None) -> bool:
+async def safe_send(bot: Bot, chat_id: int, text: str, kb=None, parse_mode: str | None = None) -> bool:
     """Отправка сообщения; False, если пользователь заблокировал бота."""
     try:
-        await bot.send_message(chat_id, text, reply_markup=kb)
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=parse_mode)
         return True
     except (TelegramForbiddenError, TelegramBadRequest):
         return False
+
+
+async def delete_search_msg(bot: Bot, user_id: int) -> None:
+    """Удаляет сообщение «Ищем собеседника…» (когда нашли собеседника или поиск отменён)."""
+    msg_id = search_msgs.pop(user_id, None)
+    if msg_id is None:
+        return
+    try:
+        await bot.delete_message(user_id, msg_id)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass  # уже удалено или недоступно
+
+
+FOUND_TEXT = (
+    "<b>💬 Начинай общение!</b>\n\n"
+    "/stop — <i>закончить диалог</i>\n"
+    "/next — <i>найти следующего</i>\n\n"
+    "<b>Комната:</b> Обычный чат 💬"
+)
 
 
 def make_captcha(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -300,11 +320,17 @@ async def start_search(user_id: int, bot: Bot) -> None:
     elif state == "already_waiting":
         await safe_send(bot, user_id, "Вы уже в очереди, ищем собеседника…", kb_wait)
     elif state == "queued":
-        await safe_send(bot, user_id, "🔍 Ищем собеседника…", kb_wait)
+        try:
+            sent = await bot.send_message(user_id, "🔍 Ищем собеседника…", reply_markup=kb_wait)
+            search_msgs[user_id] = sent.message_id
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
     else:  # matched
-        text = "✅ Собеседник найден! Можете общаться. Все сообщения анонимны."
-        ok_me = await safe_send(bot, user_id, text, kb_chat)
-        ok_partner = await safe_send(bot, partner, text, kb_chat)
+        # Убираем «Ищем собеседника…» у обоих и пишем приветствие
+        await delete_search_msg(bot, user_id)
+        await delete_search_msg(bot, partner)
+        ok_me = await safe_send(bot, user_id, FOUND_TEXT, kb_chat, parse_mode="HTML")
+        ok_partner = await safe_send(bot, partner, FOUND_TEXT, kb_chat, parse_mode="HTML")
         # Если кто-то из двоих заблокировал бота — разрываем пару
         if not ok_me or not ok_partner:
             await leave(user_id)
@@ -364,6 +390,7 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
         await offer_return(bot, user_id)
         await notify_left(bot, partner)
     elif was_waiting:
+        await delete_search_msg(bot, user_id)
         await safe_send(bot, user_id, "Поиск отменён.", kb_idle)
     else:
         await safe_send(bot, user_id, "Вы сейчас не в диалоге.", kb_idle)
@@ -373,7 +400,9 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
 @router.message(F.text == BTN_NEXT, F.chat.type == "private")
 async def cmd_next(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
-    partner, _ = await leave(user_id)
+    partner, was_waiting = await leave(user_id)
+    if was_waiting:
+        await delete_search_msg(bot, user_id)
     if partner is not None:
         await notify_left(bot, partner)
     # Сразу ищем нового (если нужна капча, start_search её запросит)
@@ -563,6 +592,10 @@ async def connect_pair(bot: Bot, a: int, b: int) -> bool:
         dialog_log[b] = log
     last_partner.pop(a, None)
     last_partner.pop(b, None)
+    last_dialog.pop(a, None)
+    last_dialog.pop(b, None)
+    await delete_search_msg(bot, a)
+    await delete_search_msg(bot, b)
 
     text = "💫 Собеседник вернулся в диалог! Все сообщения анонимны."
     ok_a = await safe_send(bot, a, text, kb_chat)

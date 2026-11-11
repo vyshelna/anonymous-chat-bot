@@ -8,6 +8,8 @@
 - /report: жалоба с передачей последних сообщений администратору (только после подтверждения).
 - Платный «возврат собеседника» за Telegram Stars (с согласием собеседника, авто-возврат звёзд).
 - /paysupport: поддержка по оплате.
+- Меню команд (кнопка «Меню»): /next, /stop, /report, /return, /start, /rules.
+- /rules: правила общения. Администратор: /ban <id> и /unban <id> (ID берётся из жалобы).
 
 КАК ЗАПУСТИТЬ (подробно см. README.md)
 1. Создайте бота у @BotFather командой /newbot и скопируйте токен.
@@ -25,9 +27,10 @@ from collections import deque
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -84,6 +87,40 @@ ADMIN_ID = env_int("ADMIN_ID", 0)
 # Сколько последних сообщений диалога передаётся администратору при жалобе
 REPORT_HISTORY = env_int("REPORT_HISTORY", 10)
 
+
+def parse_ids(raw: str) -> set[int]:
+    """Список Telegram ID через запятую -> множество чисел (неверные значения пропускаются)."""
+    ids: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+# Правила общения (команда /rules). Текст можно заменить на свой.
+RULES_TEXT = '''📌 Правила общения в анонимном чате:
+
+1. Любые упоминания психоактивных веществ (наркотиков)
+
+2. Детская порнография ("ЦП")
+
+3. Мошенничество (Scam)
+
+4. Любая реклама, спам
+
+5. Продажи чего либо (например - продажа интимных фотографий, видео)
+
+6. Любые действия, нарушающие правила Telegram
+
+❌ За нарушение правил - блокировка аккаунта'''
+
+# Сообщение заблокированному пользователю
+BAN_TEXT = "🚫 Ваш аккаунт заблокирован за нарушение правил общения. Правила: /rules"
+
+# Блокировки. Команда администратора /ban <id> действует до перезапуска бота.
+# Чтобы блокировка была постоянной, добавьте ID в переменную BANNED_IDS (через запятую).
+
 # ====================== КЛАВИАТУРЫ ======================
 # Когда пользователь не в диалоге
 kb_idle = ReplyKeyboardMarkup(
@@ -119,6 +156,8 @@ last_partner: dict[int, int] = {}     # user_id -> последний собес
 return_requests: dict[int, int] = {}  # собеседник -> тот, кто хочет вернуться (ждёт согласия)
 pay_wait: dict[int, int] = {}         # покупатель -> собеседник (согласие получено, ждём оплату)
 bg_tasks: set[asyncio.Task] = set()   # фоновые задачи (чтобы их не удалил сборщик мусора)
+
+banned: set[int] = parse_ids(os.getenv("BANNED_IDS", ""))  # заблокированные пользователи
 
 router = Router()
 
@@ -214,6 +253,10 @@ async def leave(user_id: int) -> tuple[int | None, bool]:
 
 async def start_search(user_id: int, bot: Bot) -> None:
     """Ставит пользователя в очередь или сразу соединяет с ожидающим."""
+    # Заблокированным поиск недоступен
+    if user_id in banned:
+        await safe_send(bot, user_id, BAN_TEXT, kb_idle)
+        return
     # Сначала нужно пройти капчу, если она требуется
     if user_id in need_captcha:
         await safe_send(bot, user_id, "Сначала пройдите проверку 👇", kb_idle)
@@ -258,19 +301,38 @@ async def start_search(user_id: int, bot: Bot) -> None:
 
 
 # ====================== КОМАНДЫ И КНОПКИ ======================
+def start_text() -> str:
+    """Приветствие со списком команд (зависит от настроек)."""
+    lines = [
+        "👋 Это анонимный чат. Нажмите «Искать собеседника» (или /next), чтобы найти собеседника.",
+        "",
+        "/next — поиск собеседника",
+        "/stop — завершить диалог",
+        "/report — пожаловаться на собеседника",
+    ]
+    if RETURN_PRICE_STARS > 0:
+        lines += [
+            f"/return — вернуть собеседника ({RETURN_PRICE_STARS} ⭐)",
+            "/paysupport — вопросы по оплате",
+        ]
+    lines += [
+        "/rules — правила общения",
+        "",
+        "Только для тех, кому есть 18 лет. Бот не хранит тексты переписки. Если вы подтвердите "
+        f"жалобу, последние сообщения диалога (до {REPORT_HISTORY}) и ID участников будут "
+        "переданы администратору.",
+    ]
+    return "\n".join(lines)
+
+
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "👋 Это анонимный чат. Нажмите «Искать собеседника» (или /search), "
-        "чтобы найти случайного собеседника.\n\n"
-        "/search — поиск\n/next — следующий собеседник\n/stop — завершить диалог\n"
-        "/report — пожаловаться на собеседника\n"
-        "/paysupport — вопросы по оплате ⭐\n\n"
-        "📜 Правила: только 18+, без спама, рекламы, угроз и неприемлемого контента. "
-        "Бот не хранит тексты переписки. Если вы подтвердите жалобу, последние сообщения "
-        f"диалога (до {REPORT_HISTORY}) и ID участников будут переданы администратору.",
-        reply_markup=kb_idle,
-    )
+    await message.answer(start_text(), reply_markup=kb_idle)
+
+
+@router.message(Command("rules"), F.chat.type == "private")
+async def cmd_rules(message: Message) -> None:
+    await message.answer(RULES_TEXT)
 
 
 @router.message(Command("search"), F.chat.type == "private")
@@ -458,9 +520,9 @@ async def expire_payment(bot: Bot, buyer: int, partner: int) -> None:
 
 
 async def connect_pair(bot: Bot, a: int, b: int) -> bool:
-    """Соединяет двух людей в диалог. False, если кто-то уже занят или недоступен."""
+    """Соединяет двух людей в диалог. False, если кто-то уже занят, заблокирован или недоступен."""
     async with lock:
-        if a in partners or b in partners:
+        if a in partners or b in partners or a in banned or b in banned:
             return False
         for u in (a, b):
             if u in waiting:
@@ -523,6 +585,9 @@ async def on_return_ask(call: CallbackQuery, bot: Bot) -> None:
 
     if partner is None:
         await call.answer("Этого собеседника уже нельзя вернуть.", show_alert=True)
+        return
+    if buyer in banned or partner in banned:
+        await call.answer("Вернуть этого собеседника нельзя.", show_alert=True)
         return
     if buyer in need_captcha:
         await call.answer("Сначала пройдите проверку.", show_alert=True)
@@ -693,6 +758,76 @@ async def cmd_paysupport(message: Message, command: CommandObject, bot: Bot) -> 
     await message.answer("Сообщение отправлено администратору.")
 
 
+@router.message(Command("return"), F.chat.type == "private")
+async def cmd_return(message: Message, bot: Bot) -> None:
+    """Команда /return: предложить вернуть последнего собеседника (платно)."""
+    user_id = message.from_user.id
+    if RETURN_PRICE_STARS <= 0:
+        await message.answer("Эта функция сейчас отключена.")
+        return
+    if user_id in partners:
+        await message.answer("Вы сейчас в диалоге. Завершите его (/stop), чтобы вернуть прошлого собеседника.")
+        return
+    if user_id not in last_partner:
+        await message.answer("Пока некого возвращать: вернуть можно только собеседника из последнего диалога.")
+        return
+    await offer_return(bot, user_id)
+
+
+# ====================== БЛОКИРОВКИ (только для администратора) ======================
+def is_admin(user_id: int) -> bool:
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+@router.message(Command("ban"), F.chat.type == "private")
+async def cmd_ban(message: Message, command: CommandObject, bot: Bot) -> None:
+    """/ban <id>: заблокировать пользователя. Остальным команда не отвечает."""
+    if not is_admin(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Использование: /ban 123456789 (ID из жалобы)")
+        return
+    target = int(arg)
+    if target == ADMIN_ID:
+        await message.answer("Себя заблокировать нельзя.")
+        return
+
+    banned.add(target)
+    partner, _ = await leave(target)
+    last_partner.pop(target, None)
+    if partner is not None:
+        last_partner.pop(partner, None)
+    # Убираем незавершённые запросы на возврат с участием заблокированного
+    for table in (return_requests, pay_wait):
+        for key in [k for k, v in table.items() if k == target or v == target]:
+            table.pop(key, None)
+
+    await safe_send(bot, target, BAN_TEXT, kb_idle)
+    if partner is not None:
+        await notify_left(bot, partner, offer=False)
+    await message.answer(
+        f"🚫 Пользователь {target} заблокирован до перезапуска бота. "
+        "Чтобы блокировка была постоянной, добавьте его ID в переменную BANNED_IDS на хостинге."
+    )
+
+
+@router.message(Command("unban"), F.chat.type == "private")
+async def cmd_unban(message: Message, command: CommandObject) -> None:
+    """/unban <id>: снять блокировку."""
+    if not is_admin(message.from_user.id):
+        return
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Использование: /unban 123456789")
+        return
+    banned.discard(int(arg))
+    await message.answer(
+        f"✅ Пользователь {arg} разблокирован. Если его ID записан в BANNED_IDS на хостинге, "
+        "удалите его оттуда, иначе после перезапуска бот заблокирует его снова."
+    )
+
+
 # ====================== ПЕРЕСЫЛКА СООБЩЕНИЙ ======================
 @router.message(F.chat.type == "private")
 async def relay(message: Message, bot: Bot) -> None:
@@ -708,7 +843,7 @@ async def relay(message: Message, bot: Bot) -> None:
         return
 
     if message.text and message.text.startswith("/"):
-        await message.answer("Неизвестная команда. Доступно: /search, /next, /stop.")
+        await message.answer("Неизвестная команда. Доступно: /next, /stop, /report, /rules.")
         return
 
     try:
@@ -745,6 +880,29 @@ async def start_web() -> None:
     await web.TCPSite(runner, "0.0.0.0", port).start()
 
 
+async def setup_commands(bot: Bot) -> None:
+    """Меню команд: кнопка «Меню» слева от поля ввода сообщения."""
+    commands = [
+        BotCommand(command="next", description="🎭 Поиск собеседника"),
+        BotCommand(command="stop", description="❌ Завершить диалог"),
+        BotCommand(command="report", description="🚨 Пожаловаться на собеседника"),
+    ]
+    if RETURN_PRICE_STARS > 0:
+        commands.append(
+            BotCommand(command="return", description=f"💫 Вернуть собеседника ({RETURN_PRICE_STARS} ⭐)")
+        )
+    commands += [
+        BotCommand(command="start", description="💜 Перезапуск бота"),
+        BotCommand(command="rules", description="📌 Правила общения"),
+    ]
+    if RETURN_PRICE_STARS > 0:
+        commands.append(BotCommand(command="paysupport", description="💳 Вопросы по оплате"))
+    try:
+        await bot.set_my_commands(commands)
+    except TelegramAPIError:
+        logging.warning("Не удалось установить меню команд.", exc_info=True)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     if not TOKEN:
@@ -755,6 +913,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
     await start_web()
+    await setup_commands(bot)
     # Обязательно перед стартом поллинга: убираем вебхук и старые апдейты
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)

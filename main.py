@@ -152,6 +152,9 @@ captcha_answers: dict[int, int] = {}  # user_id -> правильный отве
 # сам текст переписки бот не хранит. Список общий для обоих участников диалога.
 dialog_log: dict[int, deque] = {}
 report_pending: dict[int, int] = {}   # user_id -> собеседник, на которого он собирается жаловаться
+# user_id -> (бывший собеседник, последние сообщения): чтобы пожаловаться сразу после конца диалога.
+# Хранится в памяти только до начала следующего диалога или до жалобы.
+last_dialog: dict[int, tuple[int, list]] = {}
 last_partner: dict[int, int] = {}     # user_id -> последний собеседник (для «вернуть собеседника»)
 return_requests: dict[int, int] = {}  # собеседник -> тот, кто хочет вернуться (ждёт согласия)
 pay_wait: dict[int, int] = {}         # покупатель -> собеседник (согласие получено, ждём оплату)
@@ -213,7 +216,13 @@ async def notify_left(bot: Bot, partner: int, offer: bool = True) -> None:
         )
         await send_captcha(bot, partner)
     else:
-        await safe_send(bot, partner, "Собеседник завершил диалог.", kb_idle)
+        await safe_send(
+            bot, partner,
+            "💬 Собеседник покинул(а) чат\n\n"
+            "/next — найти следующего\n"
+            "/report — пожаловаться на спам",
+            kb_idle,
+        )
     if offer:
         await offer_return(bot, partner)
 
@@ -233,6 +242,9 @@ async def leave(user_id: int) -> tuple[int | None, bool]:
             # Запоминаем последнего собеседника (для платного «вернуть собеседника»)
             last_partner[user_id] = partner
             last_partner[partner] = user_id
+            ended_log = list(dialog_log.get(user_id, []))
+            last_dialog[user_id] = (partner, ended_log)
+            last_dialog[partner] = (user_id, ended_log)
             # Собеседник отправлял фото/видео, а диалог завершил другой -> капча
             if partner in sent_video:
                 need_captcha.add(partner)
@@ -275,6 +287,8 @@ async def start_search(user_id: int, bot: Bot) -> None:
             log: deque = deque(maxlen=REPORT_HISTORY)
             dialog_log[user_id] = log
             dialog_log[partner] = log
+            last_dialog.pop(user_id, None)
+            last_dialog.pop(partner, None)
             state = "matched"
         else:
             waiting.append(user_id)
@@ -395,9 +409,11 @@ async def send_report(bot: Bot, reporter: int, offender: int, log: list) -> None
 async def cmd_report(message: Message) -> None:
     user_id = message.from_user.id
     partner = partners.get(user_id)
+    if partner is None and user_id in last_dialog:
+        partner = last_dialog[user_id][0]   # жалоба на только что завершённый диалог
 
     if partner is None:
-        await message.answer("Пожаловаться можно только во время диалога.")
+        await message.answer("Пожаловаться можно во время диалога или сразу после него.")
         return
     if not ADMIN_ID:
         await message.answer("Жалобы сейчас недоступны.")
@@ -430,6 +446,21 @@ async def on_report(call: CallbackQuery, bot: Bot) -> None:
             pass
         return
 
+    # Диалог уже закончился, но жалоба на него ещё возможна (до начала нового диалога)
+    ended = last_dialog.get(user_id)
+    if partner is not None and partners.get(user_id) != partner and ended and ended[0] == partner:
+        await send_report(bot, user_id, partner, ended[1])
+        last_dialog.pop(user_id, None)
+        last_dialog.pop(partner, None)
+        last_partner.pop(user_id, None)
+        last_partner.pop(partner, None)
+        await call.answer("Жалоба отправлена.")
+        try:
+            await call.message.edit_text("✅ Жалоба отправлена.")
+        except TelegramBadRequest:
+            pass
+        return
+
     # Подтверждение: проверяем, что диалог ещё идёт с тем же собеседником
     if partner is None or partners.get(user_id) != partner:
         await call.answer("Диалог уже завершён.", show_alert=True)
@@ -451,6 +482,8 @@ async def on_report(call: CallbackQuery, bot: Bot) -> None:
     # После жалобы вернуть этого собеседника нельзя
     last_partner.pop(user_id, None)
     last_partner.pop(partner, None)
+    last_dialog.pop(user_id, None)
+    last_dialog.pop(partner, None)
     await notify_left(bot, partner, offer=False)
 
 
@@ -564,10 +597,10 @@ async def on_return_info(call: CallbackQuery) -> None:
     try:
         await call.message.edit_text(
             "🔄 Вернуть собеседника\n\n"
-            "Вернись в диалог с прошлым собеседником, даже если он уже нашёл другого.\n\n"
-            "🤝 Сначала спросим его согласие\n"
-            f"⏳ На ответ у него {RETURN_REQUEST_TTL} секунд\n"
-            f"💰 Платишь {RETURN_PRICE_STARS} ⭐ только после согласия\n"
+            "Вернись в диалог с собеседником — даже если он покинул чат.\n\n"
+            "🚀 Соединим сразу после его согласия\n"
+            f"🤝 Собеседник решает, вернуться ли ({RETURN_REQUEST_TTL} секунд на ответ)\n"
+            f"💰 Оплата {RETURN_PRICE_STARS} ⭐ только после согласия\n"
             "♻️ Не удалось соединить — звёзды вернутся автоматически\n\n"
             "Вопросы по оплате: /paysupport",
             reply_markup=kb,

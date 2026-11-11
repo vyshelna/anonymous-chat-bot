@@ -1,12 +1,19 @@
 """
 Анонимный Telegram-бот для общения 1 на 1 (aiogram 3).
 
-КАК ЗАПУСТИТЬ
+ВОЗМОЖНОСТИ
+- Поиск собеседника (очередь), анонимная пересылка текста, стикеров, фото, видео, голосовых и т.д.
+- /stop (завершить), /next (следующий), кнопки «Искать собеседника», «Следующий», «Завершить».
+- Капча-пример после отправки фото/видео/кружка (защита от рекламных ботов).
+- /report: жалоба с передачей последних сообщений администратору (только после подтверждения).
+- Платный «возврат собеседника» за Telegram Stars (с согласием собеседника, авто-возврат звёзд).
+- /paysupport: поддержка по оплате.
+
+КАК ЗАПУСТИТЬ (подробно см. README.md)
 1. Создайте бота у @BotFather командой /newbot и скопируйте токен.
-2. Задайте токен в переменной окружения BOT_TOKEN
-   (Linux/macOS: export BOT_TOKEN="ваш_токен", Windows: set BOT_TOKEN=ваш_токен;
-   на Koyeb — в разделе Environment variables).
-3. Установите зависимость:   pip install -U aiogram
+2. Задайте переменные окружения: BOT_TOKEN (обязательно) и ADMIN_ID (ваш Telegram ID).
+   Остальные настройки необязательны, их список есть в README.md и env.example.
+3. Установите зависимости:   pip install -r requirements.txt
 4. Запустите:               python main.py
 """
 
@@ -19,29 +26,63 @@ from collections import deque
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
 )
 
 # ====================== НАСТРОЙКИ ======================
-# Токен берётся из переменной окружения (в коде его хранить нельзя)
+# Все настройки читаются из переменных окружения, код править не нужно.
+def env_int(name: str, default: int) -> int:
+    """Целое число из переменной окружения; если не задано или неверно, берётся default."""
+    try:
+        return int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """Да/нет из переменной окружения (1/true/yes/on/да)."""
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "y", "on", "да")
+
+
+# Токен бота от @BotFather (в коде его хранить нельзя)
 TOKEN = os.getenv("BOT_TOKEN")
 
 # Тексты кнопок
 BTN_SEARCH = "Искать собеседника"
 BTN_STOP = "Завершить"
 BTN_NEXT = "Следующий"
+BTN_REPORT = "Пожаловаться"
 
-# Капча после медиа: если пользователь отправил фото, видео (или кружок) в диалоге
-# и собеседник завершил диалог (/stop или /next), перед новым поиском нужна проверка.
-# True — капча также нужна, если пользователь сам завершил диалог после видео.
-CAPTCHA_ON_OWN_END = False
+# Капча после медиа: если пользователь отправил фото, видео (или кружок) в диалоге,
+# перед новым поиском нужна проверка.
+# True  — капча нужна, когда диалог закончился ЛЮБЫМ способом (сам или собеседник).
+# False — только когда диалог завершил собеседник.
+CAPTCHA_ON_OWN_END = env_bool("CAPTCHA_ON_OWN_END", True)
+
+# Платный «возврат собеседника» (Telegram Stars, валюта XTR).
+# RETURN_PRICE_STARS = 0 полностью отключает эту функцию.
+RETURN_PRICE_STARS = env_int("RETURN_PRICE_STARS", 50)    # цена в звёздах
+RETURN_REQUEST_TTL = env_int("RETURN_REQUEST_TTL", 60)    # секунд на ответ собеседника
+PAYMENT_TTL = env_int("PAYMENT_TTL", 180)                 # секунд на оплату после согласия
+
+# Жалобы (/report): Telegram ID администратора, которому уходят жалобы.
+# Узнать свой ID можно у бота @userinfobot. Задаётся переменной окружения ADMIN_ID.
+# Администратор должен хотя бы раз нажать /start в этом боте.
+ADMIN_ID = env_int("ADMIN_ID", 0)
+# Сколько последних сообщений диалога передаётся администратору при жалобе
+REPORT_HISTORY = env_int("REPORT_HISTORY", 10)
 
 # ====================== КЛАВИАТУРЫ ======================
 # Когда пользователь не в диалоге
@@ -51,7 +92,10 @@ kb_idle = ReplyKeyboardMarkup(
 )
 # Когда пользователь в диалоге
 kb_chat = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_NEXT), KeyboardButton(text=BTN_STOP)]],
+    keyboard=[
+        [KeyboardButton(text=BTN_NEXT), KeyboardButton(text=BTN_STOP)],
+        [KeyboardButton(text=BTN_REPORT)],
+    ],
     resize_keyboard=True,
 )
 # Когда пользователь ждёт в очереди (кнопка «Завершить» отменяет поиск)
@@ -67,6 +111,14 @@ lock = asyncio.Lock()           # защита от гонок при однов
 sent_video: set[int] = set()    # кто отправлял видео в текущем диалоге
 need_captcha: set[int] = set()  # кому нужно пройти капчу перед новым поиском
 captcha_answers: dict[int, int] = {}  # user_id -> правильный ответ на текущую капчу
+# Для жалоб храним ТОЛЬКО пары (кто отправил, id сообщения) последних сообщений диалога,
+# сам текст переписки бот не хранит. Список общий для обоих участников диалога.
+dialog_log: dict[int, deque] = {}
+report_pending: dict[int, int] = {}   # user_id -> собеседник, на которого он собирается жаловаться
+last_partner: dict[int, int] = {}     # user_id -> последний собеседник (для «вернуть собеседника»)
+return_requests: dict[int, int] = {}  # собеседник -> тот, кто хочет вернуться (ждёт согласия)
+pay_wait: dict[int, int] = {}         # покупатель -> собеседник (согласие получено, ждём оплату)
+bg_tasks: set[asyncio.Task] = set()   # фоновые задачи (чтобы их не удалил сборщик мусора)
 
 router = Router()
 
@@ -102,7 +154,17 @@ async def send_captcha(bot: Bot, user_id: int) -> None:
     await safe_send(bot, user_id, text, kb)
 
 
-async def notify_left(bot: Bot, partner: int) -> None:
+async def offer_return(bot: Bot, user_id: int) -> None:
+    """Предлагает вернуть последнего собеседника (платно, за звёзды)."""
+    if RETURN_PRICE_STARS <= 0 or user_id not in last_partner:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="💫 Вернуть собеседника", callback_data="ret:info")]]
+    )
+    await safe_send(bot, user_id, "💫 Хочешь продолжить общение?\nВерни собеседника в диалог 👇", kb)
+
+
+async def notify_left(bot: Bot, partner: int, offer: bool = True) -> None:
     """Сообщает собеседнику, что диалог завершён (и просит капчу, если нужно)."""
     if partner in need_captcha:
         await safe_send(
@@ -113,6 +175,8 @@ async def notify_left(bot: Bot, partner: int) -> None:
         await send_captcha(bot, partner)
     else:
         await safe_send(bot, partner, "Собеседник завершил диалог.", kb_idle)
+    if offer:
+        await offer_return(bot, partner)
 
 
 async def leave(user_id: int) -> tuple[int | None, bool]:
@@ -127,15 +191,24 @@ async def leave(user_id: int) -> tuple[int | None, bool]:
         partner = partners.pop(user_id, None)
         if partner is not None:
             partners.pop(partner, None)
-            # Собеседник отправлял видео, а диалог завершил другой -> капча
+            # Запоминаем последнего собеседника (для платного «вернуть собеседника»)
+            last_partner[user_id] = partner
+            last_partner[partner] = user_id
+            # Собеседник отправлял фото/видео, а диалог завершил другой -> капча
             if partner in sent_video:
                 need_captcha.add(partner)
+                logging.info("Капча назначена пользователю (собеседник завершил диалог).")
             if CAPTCHA_ON_OWN_END and user_id in sent_video:
                 need_captcha.add(user_id)
+                logging.info("Капча назначена пользователю (завершил диалог сам).")
         # Новый диалог начнётся с чистого листа
         sent_video.discard(user_id)
+        dialog_log.pop(user_id, None)
+        report_pending.pop(user_id, None)
         if partner is not None:
             sent_video.discard(partner)
+            dialog_log.pop(partner, None)
+            report_pending.pop(partner, None)
         return partner, was_waiting
 
 
@@ -156,6 +229,9 @@ async def start_search(user_id: int, bot: Bot) -> None:
             partner = waiting.popleft()
             partners[user_id] = partner
             partners[partner] = user_id
+            log: deque = deque(maxlen=REPORT_HISTORY)
+            dialog_log[user_id] = log
+            dialog_log[partner] = log
             state = "matched"
         else:
             waiting.append(user_id)
@@ -187,7 +263,12 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 Это анонимный чат. Нажмите «Искать собеседника» (или /search), "
         "чтобы найти случайного собеседника.\n\n"
-        "/search — поиск\n/next — следующий собеседник\n/stop — завершить диалог",
+        "/search — поиск\n/next — следующий собеседник\n/stop — завершить диалог\n"
+        "/report — пожаловаться на собеседника\n"
+        "/paysupport — вопросы по оплате ⭐\n\n"
+        "📜 Правила: только 18+, без спама, рекламы, угроз и неприемлемого контента. "
+        "Бот не хранит тексты переписки. Если вы подтвердите жалобу, последние сообщения "
+        f"диалога (до {REPORT_HISTORY}) и ID участников будут переданы администратору.",
         reply_markup=kb_idle,
     )
 
@@ -208,6 +289,7 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
         await safe_send(bot, user_id, "Диалог завершён.", kb_idle)
         if user_id in need_captcha:  # только при CAPTCHA_ON_OWN_END = True
             await send_captcha(bot, user_id)
+        await offer_return(bot, user_id)
         await notify_left(bot, partner)
     elif was_waiting:
         await safe_send(bot, user_id, "Поиск отменён.", kb_idle)
@@ -224,6 +306,94 @@ async def cmd_next(message: Message, bot: Bot) -> None:
         await notify_left(bot, partner)
     # Сразу ищем нового (если нужна капча, start_search её запросит)
     await start_search(user_id, bot)
+
+
+# ====================== ЖАЛОБЫ ======================
+async def send_report(bot: Bot, reporter: int, offender: int, log: list) -> None:
+    """Передаёт администратору последние сообщения диалога и ID участников."""
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🚨 Жалоба\nАвтор жалобы: {reporter}\nНа кого жалоба: {offender}\n"
+            f"Последние сообщения ({len(log)}), от старых к новым:",
+        )
+        last_sender = None
+        for sender, msg_id in log:
+            if sender != last_sender:
+                who = "Автор жалобы" if sender == reporter else "На кого жалоба"
+                await bot.send_message(ADMIN_ID, f"— {who} ({sender}):")
+                last_sender = sender
+            try:
+                # Копия сообщения из чата отправителя (без пометки «переслано»)
+                await bot.copy_message(ADMIN_ID, from_chat_id=sender, message_id=msg_id)
+            except TelegramBadRequest:
+                pass  # сообщение удалено или недоступно
+    except (TelegramForbiddenError, TelegramBadRequest):
+        logging.warning("Не удалось отправить жалобу администратору: он должен нажать /start в боте.")
+
+
+@router.message(Command("report"), F.chat.type == "private")
+@router.message(F.text == BTN_REPORT, F.chat.type == "private")
+async def cmd_report(message: Message) -> None:
+    user_id = message.from_user.id
+    partner = partners.get(user_id)
+
+    if partner is None:
+        await message.answer("Пожаловаться можно только во время диалога.")
+        return
+    if not ADMIN_ID:
+        await message.answer("Жалобы сейчас недоступны.")
+        return
+
+    report_pending[user_id] = partner
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="Отправить жалобу", callback_data="rep:yes"),
+            InlineKeyboardButton(text="Отмена", callback_data="rep:no"),
+        ]]
+    )
+    await message.answer(
+        f"⚠️ Отправить жалобу? Последние сообщения этого диалога (до {REPORT_HISTORY}) "
+        "и ID участников будут переданы администратору, а диалог завершится.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("rep:"))
+async def on_report(call: CallbackQuery, bot: Bot) -> None:
+    user_id = call.from_user.id
+    partner = report_pending.pop(user_id, None)
+
+    if call.data == "rep:no":
+        await call.answer("Отменено.")
+        try:
+            await call.message.edit_text("Жалоба отменена.")
+        except TelegramBadRequest:
+            pass
+        return
+
+    # Подтверждение: проверяем, что диалог ещё идёт с тем же собеседником
+    if partner is None or partners.get(user_id) != partner:
+        await call.answer("Диалог уже завершён.", show_alert=True)
+        try:
+            await call.message.edit_text("Диалог уже завершён.")
+        except TelegramBadRequest:
+            pass
+        return
+
+    log = list(dialog_log.get(user_id, []))
+    await send_report(bot, user_id, partner, log)
+    await leave(user_id)
+    await call.answer("Жалоба отправлена.")
+    try:
+        await call.message.edit_text("✅ Жалоба отправлена. Диалог завершён.")
+    except TelegramBadRequest:
+        pass
+    await safe_send(bot, user_id, "Можно искать нового собеседника.", kb_idle)
+    # После жалобы вернуть этого собеседника нельзя
+    last_partner.pop(user_id, None)
+    last_partner.pop(partner, None)
+    await notify_left(bot, partner, offer=False)
 
 
 # ====================== КАПЧА (нажатие кнопки с ответом) ======================
@@ -256,6 +426,273 @@ async def on_captcha(call: CallbackQuery, bot: Bot) -> None:
             pass
 
 
+# ====================== ПЛАТНЫЙ ВОЗВРАТ СОБЕСЕДНИКА (Telegram Stars) ======================
+# Как это работает:
+# 1. После диалога человек нажимает «Вернуть собеседника» -> «Вернуть за 50 ⭐».
+# 2. Бывшему собеседнику уходит запрос. Вернуть человека БЕЗ его согласия нельзя.
+# 3. Если он согласился, покупателю приходит счёт на 50 ⭐. Пока нет согласия, платить не нужно.
+# 4. После оплаты оба снова соединяются. Если соединить не удалось, звёзды возвращаются автоматически.
+def spawn(coro) -> None:
+    """Запускает фоновую задачу и хранит на неё ссылку."""
+    task = asyncio.create_task(coro)
+    bg_tasks.add(task)
+    task.add_done_callback(bg_tasks.discard)
+
+
+async def expire_request(bot: Bot, buyer: int, partner: int) -> None:
+    """Если собеседник не ответил на запрос вовремя, отменяем его."""
+    await asyncio.sleep(RETURN_REQUEST_TTL)
+    if return_requests.get(partner) == buyer:
+        return_requests.pop(partner, None)
+        await safe_send(bot, buyer, "⌛ Собеседник не ответил на запрос. Платить не нужно.", kb_idle)
+        await safe_send(bot, partner, "⌛ Запрос на возврат собеседника устарел.")
+
+
+async def expire_payment(bot: Bot, buyer: int, partner: int) -> None:
+    """Если покупатель не оплатил вовремя, отменяем возврат."""
+    await asyncio.sleep(PAYMENT_TTL)
+    if pay_wait.get(buyer) == partner:
+        pay_wait.pop(buyer, None)
+        await safe_send(bot, buyer, "⌛ Время на оплату вышло, звёзды не списаны. Можно запросить возврат заново.")
+        await safe_send(bot, partner, "⌛ Собеседник не оплатил возврат. Диалог не продолжится.")
+
+
+async def connect_pair(bot: Bot, a: int, b: int) -> bool:
+    """Соединяет двух людей в диалог. False, если кто-то уже занят или недоступен."""
+    async with lock:
+        if a in partners or b in partners:
+            return False
+        for u in (a, b):
+            if u in waiting:
+                waiting.remove(u)
+        partners[a] = b
+        partners[b] = a
+        log: deque = deque(maxlen=REPORT_HISTORY)
+        dialog_log[a] = log
+        dialog_log[b] = log
+    last_partner.pop(a, None)
+    last_partner.pop(b, None)
+
+    text = "💫 Собеседник вернулся в диалог! Все сообщения анонимны."
+    ok_a = await safe_send(bot, a, text, kb_chat)
+    ok_b = await safe_send(bot, b, text, kb_chat)
+    if not ok_a or not ok_b:
+        await leave(a)
+        return False
+    return True
+
+
+async def refund_stars(bot: Bot, user_id: int, charge_id: str) -> bool:
+    """Возвращает звёзды за платёж. True, если получилось."""
+    try:
+        await bot.refund_star_payment(user_id=user_id, telegram_payment_charge_id=charge_id)
+        return True
+    except Exception:  # noqa: BLE001 — любая ошибка API: логируем и сообщаем
+        logging.exception("Не удалось вернуть звёзды (charge_id=%s)", charge_id)
+        return False
+
+
+@router.callback_query(F.data == "ret:info")
+async def on_return_info(call: CallbackQuery) -> None:
+    if call.from_user.id not in last_partner:
+        await call.answer("Этого собеседника уже нельзя вернуть.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=f"💫 Вернуть за {RETURN_PRICE_STARS} ⭐", callback_data="ret:ask")
+        ]]
+    )
+    await call.answer()
+    try:
+        await call.message.edit_text(
+            "💫 Вернуть собеседника\n\n"
+            "Мы отправим вашему прошлому собеседнику запрос. Если он согласится, "
+            f"вы оплатите {RETURN_PRICE_STARS} ⭐ и диалог продолжится.\n"
+            f"Если он откажется или не ответит за {RETURN_REQUEST_TTL} секунд, платить не придётся.\n\n"
+            "Вопросы по оплате: /paysupport",
+            reply_markup=kb,
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "ret:ask")
+async def on_return_ask(call: CallbackQuery, bot: Bot) -> None:
+    buyer = call.from_user.id
+    partner = last_partner.get(buyer)
+
+    if partner is None:
+        await call.answer("Этого собеседника уже нельзя вернуть.", show_alert=True)
+        return
+    if buyer in need_captcha:
+        await call.answer("Сначала пройдите проверку.", show_alert=True)
+        await send_captcha(bot, buyer)
+        return
+    if buyer in partners:
+        await call.answer("Вы уже в диалоге.", show_alert=True)
+        return
+    if partner in partners:
+        await call.answer("Собеседник уже общается с кем-то другим.", show_alert=True)
+        return
+    if partner in return_requests:
+        await call.answer("Запрос уже отправлен, подождите ответа.", show_alert=True)
+        return
+
+    return_requests[partner] = buyer
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Принять", callback_data="ret:yes"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data="ret:no"),
+        ]]
+    )
+    sent = await safe_send(
+        bot, partner,
+        "💫 Ваш прошлый собеседник хочет продолжить диалог. Принять?",
+        kb,
+    )
+    if not sent:
+        return_requests.pop(partner, None)
+        await call.answer("Собеседник сейчас недоступен.", show_alert=True)
+        return
+
+    await call.answer()
+    try:
+        await call.message.edit_text(
+            f"⏳ Запрос отправлен. Ждём ответ до {RETURN_REQUEST_TTL} секунд. Платить пока не нужно."
+        )
+    except TelegramBadRequest:
+        pass
+    spawn(expire_request(bot, buyer, partner))
+
+
+@router.callback_query(F.data == "ret:no")
+async def on_return_decline(call: CallbackQuery, bot: Bot) -> None:
+    partner = call.from_user.id
+    buyer = return_requests.pop(partner, None)
+    await call.answer()
+    try:
+        await call.message.edit_text("Вы отказались продолжать диалог.")
+    except TelegramBadRequest:
+        pass
+    if buyer is not None:
+        await safe_send(bot, buyer, "Собеседник отказался продолжать диалог. Платить не нужно.", kb_idle)
+
+
+@router.callback_query(F.data == "ret:yes")
+async def on_return_accept(call: CallbackQuery, bot: Bot) -> None:
+    partner = call.from_user.id
+    buyer = return_requests.pop(partner, None)
+
+    if buyer is None:
+        await call.answer("Запрос уже устарел.", show_alert=True)
+        try:
+            await call.message.edit_text("Запрос уже устарел.")
+        except TelegramBadRequest:
+            pass
+        return
+    if partner in need_captcha:
+        return_requests[partner] = buyer  # запрос остаётся, пока человек проходит проверку
+        await call.answer("Сначала пройдите проверку.", show_alert=True)
+        await send_captcha(bot, partner)
+        return
+    if partner in partners or buyer in partners:
+        await call.answer("Диалог уже недоступен.", show_alert=True)
+        await safe_send(bot, buyer, "Не получилось вернуть собеседника. Платить не нужно.", kb_idle)
+        return
+
+    pay_wait[buyer] = partner
+    await call.answer()
+    try:
+        await call.message.edit_text("✅ Вы согласились. Ждём, пока собеседник оплатит возврат.")
+    except TelegramBadRequest:
+        pass
+
+    try:
+        await bot.send_invoice(
+            chat_id=buyer,
+            title="Вернуть собеседника",
+            description="Собеседник согласился продолжить диалог. Оплатите, чтобы вернуться в чат.",
+            payload="return_partner",
+            currency="XTR",  # Telegram Stars; provider_token для звёзд не нужен
+            prices=[LabeledPrice(label="Вернуть собеседника", amount=RETURN_PRICE_STARS)],
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pay_wait.pop(buyer, None)
+        await safe_send(bot, partner, "Не получилось отправить счёт собеседнику. Диалог не продолжится.")
+        return
+    spawn(expire_payment(bot, buyer, partner))
+
+
+@router.pre_checkout_query()
+async def on_pre_checkout(query: PreCheckoutQuery) -> None:
+    """Telegram спрашивает бота, можно ли принять оплату (нужно ответить за 10 секунд)."""
+    buyer = query.from_user.id
+    partner = pay_wait.get(buyer)
+    if partner is None:
+        await query.answer(ok=False, error_message="Запрос устарел. Оплата не списана.")
+        return
+    if buyer in partners or partner in partners:
+        await query.answer(ok=False, error_message="Диалог уже недоступен. Оплата не списана.")
+        return
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def on_successful_payment(message: Message, bot: Bot) -> None:
+    buyer = message.from_user.id
+    payment = message.successful_payment
+    partner = pay_wait.pop(buyer, None)
+    logging.info(
+        "Оплата Stars: сумма=%s charge_id=%s", payment.total_amount, payment.telegram_payment_charge_id
+    )
+
+    if partner is not None and await connect_pair(bot, buyer, partner):
+        return
+
+    # Соединить не получилось — возвращаем звёзды автоматически
+    if await refund_stars(bot, buyer, payment.telegram_payment_charge_id):
+        await safe_send(
+            bot, buyer,
+            f"Не удалось вернуть собеседника, {payment.total_amount} ⭐ возвращены вам.",
+            kb_idle,
+        )
+    else:
+        await safe_send(
+            bot, buyer,
+            "Не удалось вернуть собеседника и автоматически вернуть звёзды. "
+            "Напишите: /paysupport ваше сообщение",
+            kb_idle,
+        )
+        if ADMIN_ID:
+            await safe_send(
+                bot, ADMIN_ID,
+                f"⚠️ Не удалось вернуть звёзды.\nПокупатель: {buyer}\n"
+                f"charge_id: {payment.telegram_payment_charge_id}\nСумма: {payment.total_amount} ⭐",
+            )
+
+
+@router.message(Command("paysupport"), F.chat.type == "private")
+async def cmd_paysupport(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Поддержка по платежам (Telegram требует эту команду у ботов с оплатой)."""
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "💳 Вопросы по оплате ⭐\n\n"
+            "Если звёзды списались, а собеседник не вернулся, они возвращаются автоматически. "
+            "Если этого не произошло, напишите так:\n/paysupport ваше сообщение"
+        )
+        return
+    if not ADMIN_ID:
+        await message.answer("Поддержка сейчас недоступна.")
+        return
+    try:
+        await bot.send_message(ADMIN_ID, f"💳 Обращение по оплате от {message.from_user.id}:\n{text[:1000]}")
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await message.answer("Не удалось отправить сообщение, попробуйте позже.")
+        return
+    await message.answer("Сообщение отправлено администратору.")
+
+
 # ====================== ПЕРЕСЫЛКА СООБЩЕНИЙ ======================
 @router.message(F.chat.type == "private")
 async def relay(message: Message, bot: Bot) -> None:
@@ -279,6 +716,10 @@ async def relay(message: Message, bot: Bot) -> None:
         # поэтому имя, username и ID отправителя полностью скрыты.
         # Работает для текста, стикеров, фото, голосовых, видео, кружков, файлов и т.д.
         await message.copy_to(partner)
+        # Для жалоб запоминаем только id сообщения (не текст)
+        log = dialog_log.get(user_id)
+        if log is not None:
+            log.append((user_id, message.message_id))
         # Запоминаем, что пользователь отправлял фото/видео/кружок в этом диалоге
         if message.photo or message.video or message.video_note:
             sent_video.add(user_id)
@@ -308,6 +749,8 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     if not TOKEN:
         raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
+    if not ADMIN_ID:
+        logging.warning("ADMIN_ID не задан: жалобы (/report) будут недоступны.")
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
